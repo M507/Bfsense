@@ -1,8 +1,0 @@
-app:
-  build: .
-  volumes:
-    - "$PWD:/usr/src/app"
-    - "$HOME:/home"
-  ports:
-    - "5151:5151"
-    - "5150:5150"
