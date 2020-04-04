@@ -1,922 +1,327 @@
-<?php
-/*
- * pkg_mgr_install.php
- *
- * part of pfSense (https://www.pfsense.org)
- * Copyright (c) 2004-2013 BSD Perimeter
- * Copyright (c) 2013-2016 Electric Sheep Fencing
- * Copyright (c) 2014-2020 Rubicon Communications, LLC (Netgate)
- * Copyright (c) 2005 Colin Smith
- * All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 
-##|+PRIV
-##|*IDENT=page-system-packagemanager-installpackage
-##|*NAME=System: Package Manager: Install Package
-##|*DESCR=Allow access to the 'System: Package Manager: Install Package' page.
-##|*MATCH=pkg_mgr_install.php*
-##|-PRIV
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
 
-ini_set('max_execution_time', '0');
+	<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+	<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+	<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+	<link rel="manifest" href="/manifest.json">
+	<link rel="mask-icon" href="/safari-pinned-tab.svg" color="#5bbad5">
+	<meta name="theme-color" content="#ffffff">
 
-require_once("guiconfig.inc");
-require_once("functions.inc");
-require_once("filter.inc");
-require_once("shaper.inc");
-require_once("pkg-utils.inc");
+	<link rel="stylesheet" href="/vendor/font-awesome/css/font-awesome.min.css?v=1580510450">
+	<link rel="stylesheet" href="/vendor/sortable/sortable-theme-bootstrap.css?v=1580510450">
+	<link rel="stylesheet" href="/css/pfSense.css?v=1580510450" />
 
-$sendto = "output";
-$start_polling = false;
-$firmwareupdate = false;
-$guitimeout = 90;	// Seconds to wait before reloading the page after reboot
-$guiretry = 20;		// Seconds to try again if $guitimeout was not long enough
-//---------------------------------------------------------------------------------------------------------------------
-// After an installation or removal has been started (mwexec(/usr/local/sbin/pfSense-upgrade-GUI.sh . . . )) AJAX calls
-// are made to get status.
-// The log file is read and the newest progress record retrieved. The data is formatted
-// as JSON before being returned to the AJAX caller (at the bottom of this file)
-//
-// Arguments received here:
-//		logfilename = Passed to installation script to tell it how to name the log file we will parse
-//		next_log_line = Send log file entries that come after this line number
-//
-// JSON items returned
-//		log:
-//		exitcode:
-//		data:{current:, total}
-//		notice:
-//
-// Todo:
-//		Respect next_log_line and append log to output window rather than writing it
+	<title>pfSense.localdomain - System: Package Manager: Installed Packages</title>
+	<script type="text/javascript">
+	//<![CDATA[
+	var events = events || [];
+	var newSeperator = false;
+	//]]>
+	</script>
+<script type="text/javascript">if (top != self) {top.location.href = self.location.href;}</script><script type="text/javascript">var csrfMagicToken = "sid:f118127bb7a2979d54032e1e4782f54677992ded,1585990412";var csrfMagicName = "__csrf_magic";</script><script src="/csrf/csrf-magic.js" type="text/javascript"></script></head>
 
-$gui_pidfile = $g['varrun_path'] . '/' . $g['product_name'] . '-upgrade-GUI.pid';
-$gui_mode = $g['varrun_path'] . '/' . $g['product_name'] . '-upgrade-GUI.mode';
-$sock_file = "{$g['tmp_path']}/{$g['product_name']}-upgrade.sock";
-$pfsense_upgrade = "/usr/local/sbin/{$g['product_name']}-upgrade";
-$repos = pkg_list_repos();
-
-$pkgname = '';
-
-if (!empty($_REQUEST['pkg'])) {
-	$pkgname = $_REQUEST['pkg'];
-}
-
-if ($_REQUEST['ajax']) {
-	$response = "";
-	$code = 0;
-	$postlog = "";
-
-	if (isset($_REQUEST['logfilename'])) {
-		if ($_REQUEST['logfilename'] == "UPGR") {
-			$postlog = $g['cf_conf_path'] . '/upgrade_log';
-		}
-
-		if ($_REQUEST['logfilename'] == "PKG") {
-			$postlog = $g['cf_conf_path'] . '/pkg_log_' . $pkgname;
-		}
-	}
-
-	// If this is an ajax call to get the installed and newest versions, call that function,
-	// JSON encode the result, print it and exit
-	if ($_REQUEST['getversion']) {
-		$firmwareversions = get_system_pkg_version(true, false);
-		print(json_encode($firmwareversions));
-		exit;
-	}
-
-	// Check to see if our process is still running
-	$running = "running";
-
-	// When we do a reinstallall, it is technically possible that we might catch the system in-between
-	// packages, hence the de-bounce here
-	for ($idx=0;$idx<5 && !isvalidpid($gui_pidfile); $idx++) {
-		usleep(200000);
-	}
-
-	if (!isvalidpid($gui_pidfile)) {
-		$running = "stopped";
-		// The log files may not be complete when the process terminates so we need wait until we see the
-		// exit status (__RC=x)
-		waitfor_string_in_file($postlog . '.txt', "__RC=", 10);
-		filter_configure();
-		send_event("service restart packages");
-	}
-
-	$pidarray = array('pid' => $running);
-
-	// Process log file -----------------------------------------------------------------------------------------------
-	$logfile = @fopen($postlog . '.txt', "r");
-
-	if ($logfile != FALSE) {
-		$resparray = array();
-		$statusarray = array();
-		$code = array();
-		$notice = array('notice' => "");
-
-		// Log file is read a line at a time so that we can detect/modify certain entries
-		while (($logline = fgets($logfile)) !== false) {
-			// Check for return codes and replace with suitable strings
-			$rc_pos = strpos($logline, "__RC=");
-			if ($rc_pos !== false) {
-				$rc_string = substr($logline, $rc_pos);
-				$code = explode(" ", $rc_string);
-
-				$rc = str_replace("__RC=", "", $code[0]);
-
-				if (count($code) > 1 &&
-				    strpos($code[1], "REBOOT_AFTER") !== false) {
-					$statusarray['reboot_needed'] = "yes";
-				} else {
-					$statusarray['reboot_needed'] = "no";
-				}
-
-				if ($rc == 0) {
-					$logline = gettext("Success") . "\n";
-				} else {
-					$logline = gettext("Failed") . "\n";
-				}
-
-				$response .= $logline;
-				$statusarray['exitstatus'] = $rc;
-			} else {
-				$response .= htmlspecialchars($logline);
-			}
-		}
-
-		fclose($logfile);
-		$resparray['log'] = $response;
-	} else {
-		$resparray['log'] = "not_ready";
-		print(json_encode($resparray));
-		exit;
-	}
-
-	// Process progress file ------------------------------------------------------------------------------------------
-	$progress = "";
-	$progarray = array();
-
-	$JSONfile = @fopen($postlog . '.json', "r");
-
-	if ($JSONfile != FALSE) {
-		while (($logline = fgets($JSONfile)) !== false) {
-			if (!feof($JSONfile) && (strpos($logline, 'INFO_PROGRESS_TICK') !== false)) {
-				if (strpos($logline, '}}') !== false) {
-					$progress = $logline;
-				}
-			}
-		}
-
-		fclose($JSONfile);
-
-		if (strlen($progress) > 0) {
-			$progarray = json_decode($progress, true);
-		}
-	}
-
-	//
-	$ui_notice = "/tmp/package_ui_notice";
-
-	if (file_exists($ui_notice)) {
-		$notice['notice'] = file_get_contents($ui_notice);
-	}
-
-	// Glob all the arrays we have made together, and convert to JSON
-	print(json_encode($resparray + $pidarray + $statusarray + $progarray + $notice));
-
-	exit;
-}
-
-function waitfor_string_in_file($filename, $string, $timeout) {
-	$start = $now = time();
-
-	while (($now - $start) < $timeout) {
-		$testfile = @fopen($filename, "r");
-
-		if ($testfile != FALSE) {
-			while (($line = fgets($testfile)) !== false) {
-				if (strpos($line, $string) !== false) {
-					fclose($testfile);
-					return(true);
-				}
-			}
-
-			fclose($testfile);
-		}
-
-	usleep(100000);
-	$now = time();
-	}
-
-	return(false);
-}
-
-$pkgmode = '';
-
-if (!empty($_REQUEST['mode'])) {
-	$valid_modes = array(
-		'reinstallall',
-		'reinstallpkg',
-		'delete',
-		'installed'
-	);
-
-	if (!in_array($_REQUEST['mode'], $valid_modes)) {
-		header("Location: pkg_mgr_installed.php");
-		return;
-	}
-
-	$pkgmode = $_REQUEST['mode'];
-}
-
-// After a successful installation/removal/update the page is reloaded so that any menu changes show up
-// immediately. These values passed as POST arguments tell the page the state it was in before the reload.
-$confirmed = isset($_POST['confirmed']) && $_POST['confirmed'] == 'true';
-$completed = isset($_POST['completed']) && $_POST['completed'] == 'true';
-$reboot_needed = isset($_POST['reboot_needed']) && $_POST['reboot_needed'] == "yes";
-
-$postlog = "";
-
-if (isvalidpid($gui_pidfile) && file_exists($sock_file)) {
-	$progbar = true;
-	$mode = "firmwareupdate";
-	if (file_exists($gui_mode)) {
-		$mode = file($gui_mode);
-		if (isset($mode[1])) {
-			$pkgname = $mode[1];
-		}
-		$mode = $mode[0];
-	}
-	switch ($mode) {
-	case 'firmwareupdate':
-		$logfilename = $g['cf_conf_path'] . '/upgrade_log';
-		$postlog = "UPGR";
-		break;
-	case 'reinstallall':
-		$progbar = false;
-	default:
-		$logfilename = $g['cf_conf_path'] . '/pkg_log_' . $pkgname;
-		$postlog = "PKG";
-	}
-
-	$start_polling = true;
-	$confirmed = true;
-}
-
-if (!empty($_REQUEST['id'])) {
-	if ($_REQUEST['id'] != "firmware") {
-		header("Location: pkg_mgr_installed.php");
-		return;
-	}
-
-	$firmwareupdate = true;
-
-	// If the user changes the firmware branch to sync to, switch to the newly selected repo
-	// and save their choice
-	if ($_REQUEST['refrbranch']) {
-		foreach ($repos as $repo) {
-			if ($repo['name'] == $_POST['fwbranch']) {
-				$config['system']['pkg_repo_conf_path'] = $repo['path'];
-				pkg_switch_repo($repo['path']);
-				write_config(gettext("Saved firmware branch setting."));
-				break;
-			}
-		}
-	}
-} elseif (!$completed && empty($_REQUEST['pkg']) && $pkgmode != 'reinstallall') {
-	header("Location: pkg_mgr_installed.php");
-	return;
-}
-
-if (!empty($_REQUEST['pkg'])) {
-	if (!pkg_valid_name($pkgname)) {
-		header("Location: pkg_mgr_installed.php");
-		return;
-	}
-}
-
-$tab_array = array();
-
-if ($firmwareupdate) {
-	$pgtitle = array(gettext("System"), gettext("Update"), gettext("System Update"));
-	$pglinks = array("", "@self", "@self");
-	$tab_array[] = array(gettext("System Update"), true, "pkg_mgr_install.php?id=firmware");
-	$tab_array[] = array(gettext("Update Settings"), false, "system_update_settings.php");
-} else {
-	$pgtitle = array(gettext("System"), gettext("Package Manager"), gettext("Package Installer"));
-	$pglinks = array("", "pkg_mgr_installed.php", "@self");
-	$tab_array[] = array(gettext("Installed Packages"), false, "pkg_mgr_installed.php");
-	$tab_array[] = array(gettext("Available Packages"), false, "pkg_mgr.php");
-	$tab_array[] = array(gettext("Package Installer"), true, "");
-}
-
-include("head.inc");
-?>
-
-<div id="final" class="alert" role="alert" style="display: none;"></div>
-
-<?php
-display_top_tabs($tab_array);
-
-if ($input_errors) {
-	print_input_errors($input_errors);
-}
-
-?>
-<form action="pkg_mgr_install.php" method="post" class="form-horizontal">
-<?php
-
-if (!isvalidpid($gui_pidfile) && !$confirmed && !$completed &&
-    ($firmwareupdate || $pkgmode == 'reinstallall' || !empty($pkgname))):
-	switch ($pkgmode) {
-		case 'reinstallpkg':
-			$pkgtxt = sprintf(gettext('Confirmation Required to reinstall package %s.'), $pkgname);
-			break;
-		case 'delete':
-			$pkgtxt = sprintf(gettext('Confirmation Required to remove package %s.'), $pkgname);
-			break;
-		case 'installed':
-		default:
-			$pkgtxt = sprintf(gettext('Confirmation Required to install package %s.'), $pkgname);
-			break;
-	}
-
-?>
-	<div class="panel panel-default">
-		<div class="panel-heading">
-			<h2 class="panel-title">
-<?php
-			if ($pkgmode == 'reinstallall'):
-?>
-				<?=gettext("Confirmation Required to reinstall all packages.");?>
-<?php
-			elseif ($_REQUEST['from'] && $_REQUEST['to']):
-?>
-				<?=sprintf(gettext('Confirmation Required to upgrade package %1$s from %2$s to %3$s.'), $pkgname, htmlspecialchars($_REQUEST['from']), htmlspecialchars($_REQUEST['to']))?>
-<?php
-			elseif ($firmwareupdate):
-?>
-				<?=sprintf(gettext('Confirmation Required to update %s system.'), $g['product_name'])?>
-<?php
-			else:
-?>
-				<?=$pkgtxt;?>
-<?php
-			endif;
-?>
-			</h2>
+<body id="2">
+<nav id="topmenu" class="navbar navbar-static-top navbar-inverse">
+	<div class="container">
+		<div class="navbar-header">
+			<button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#pf-navbar">
+				<span class="sr-only">Toggle navigation</span>
+				<span class="icon-bar"></span>
+				<span class="icon-bar"></span>
+				<span class="icon-bar"></span>
+			</button>
+			<a class="navbar-brand" href="/">
+				<svg id="logo" role="img" aria-labelledby="pfsense-logo" x="0px" y="0px" viewBox="0 0 282.8 84.2">
+	<title id="pfsense-logo-svg">pfSense Logo</title>
+	<path class="logo-st0" d="M27.8,57.7c2.9,0,5.4-0.9,7.5-2.6c2.1-1.7,3.6-4,4.4-6.8c0.8-2.8,0.6-5.1-0.5-6.8c-1.1-1.7-3.2-2.6-6.1-2.6 c-2.9,0-5.4,0.9-7.5,2.6c-2.1,1.7-3.5,4-4.3,6.8c-0.8,2.8-0.7,5.1,0.5,6.8C22.8,56.9,24.8,57.7,27.8,57.7"/>
+	<path class="logo-st0" d="M115.1,46.6c-1.5-0.8-3-1.4-4.7-1.8c-1.7-0.4-3.2-0.7-4.7-1.1c-1.5-0.3-2.7-0.7-3.6-1.1c-0.9-0.4-1.4-1.1-1.4-2 c0-1.1,0.5-1.9,1.4-2.4c0.9-0.5,1.9-0.7,2.8-0.7c2.8,0,5,1,6.7,3.1l7-7c-1.7-1.8-3.9-3.1-6.4-3.8c-2.5-0.7-5-1.1-7.4-1.1 c-1.9,0-3.9,0.2-5.7,0.7c-1.9,0.5-3.6,1.2-5,2.3c-1.5,1-2.6,2.3-3.5,3.9c-0.9,1.6-1.3,3.5-1.3,5.7c0,2.3,0.5,4.2,1.4,5.6 c0.9,1.4,2.1,2.5,3.6,3.3c1.5,0.8,3,1.3,4.7,1.7c1.7,0.4,3.2,0.7,4.7,1.1c1.5,0.3,2.7,0.7,3.6,1.2c0.9,0.5,1.4,1.2,1.4,2.2 c0,1-0.5,1.7-1.6,2.1c-1.1,0.4-2.3,0.6-3.6,0.6c-1.7,0-3.3-0.3-4.6-1c-1.3-0.7-2.5-1.7-3.6-3l-7,7.7c1.8,1.9,4.1,3.2,6.7,3.9 c2.7,0.7,5.3,1.1,7.9,1.1c2,0,4-0.2,6.1-0.6c2-0.4,3.9-1,5.5-2c1.6-0.9,3-2.2,4-3.8c1-1.6,1.6-3.5,1.6-5.9c0-2.3-0.5-4.2-1.4-5.6 C117.7,48.6,116.5,47.4,115.1,46.6"/>
+	<path class="logo-st0" d="M156.3,34.1c-1.5-1.7-3.3-3-5.5-3.9c-2.2-0.9-4.6-1.4-7.2-1.4c-2.9,0-5.6,0.5-8.1,1.4c-2.5,0.9-4.7,2.2-6.6,3.9 c-1.9,1.7-3.3,3.8-4.4,6.2c-1.1,2.4-1.6,5.1-1.6,8c0,3,0.5,5.6,1.6,8c1.1,2.4,2.5,4.5,4.4,6.2c1.9,1.7,4.1,3,6.6,3.9 c2.5,0.9,5.2,1.4,8.1,1.4c3,0,5.9-0.6,8.7-1.9c2.8-1.3,5.1-3.1,7-5.4l-8-5.9c-1,1.3-2.1,2.4-3.4,3.3c-1.3,0.8-2.9,1.3-4.8,1.3 c-2.2,0-4.1-0.7-5.7-2c-1.5-1.3-2.5-3.1-3-5.2H161v-3.6c0-3-0.4-5.6-1.2-8C159,37.9,157.8,35.8,156.3,34.1 M134.3,44.1 c0.1-0.9,0.3-1.8,0.7-2.6c0.4-0.8,0.9-1.6,1.6-2.2c0.7-0.6,1.5-1.2,2.5-1.6c1-0.4,2.1-0.6,3.4-0.6c2.1,0,3.8,0.7,5.1,2.1 c1.3,1.4,2,3,1.9,5H134.3z"/>
+	<path class="logo-st0" d="M198.3,33.8c-1-1.6-2.4-2.8-4.2-3.7c-1.8-0.9-4.1-1.3-7-1.3c-1.4,0-2.7,0.2-3.8,0.5c-1.2,0.4-2.2,0.8-3.1,1.4 c-0.9,0.6-1.7,1.2-2.4,1.9c-0.7,0.7-1.2,1.4-1.5,2.1H176v-5.1h-11v37.2h11.5V48.4c0-1.2,0.1-2.4,0.2-3.5c0.2-1.1,0.5-2.1,1-3 c0.5-0.9,1.2-1.6,2.1-2.1c0.9-0.5,2.1-0.8,3.6-0.8c1.5,0,2.6,0.3,3.4,0.9c0.8,0.6,1.4,1.4,1.8,2.4c0.4,1,0.6,2,0.7,3.2 c0.1,1.1,0.1,2.3,0.1,3.3v18.2h11.5V46.4c0-2.5-0.2-4.8-0.5-7C199.9,37.3,199.3,35.4,198.3,33.8"/>
+	<path class="logo-st0" d="M231.5,46.6c-1.5-0.8-3-1.4-4.7-1.8c-1.7-0.4-3.2-0.7-4.7-1.1c-1.5-0.3-2.7-0.7-3.6-1.1c-0.9-0.4-1.4-1.1-1.4-2 c0-1.1,0.5-1.9,1.4-2.4c0.9-0.5,1.9-0.7,2.8-0.7c2.8,0,5,1,6.7,3.1l7-7c-1.7-1.8-3.9-3.1-6.4-3.8c-2.5-0.7-5-1.1-7.4-1.1 c-1.9,0-3.9,0.2-5.7,0.7c-1.9,0.5-3.6,1.2-5,2.3c-1.5,1-2.6,2.3-3.5,3.9c-0.9,1.6-1.3,3.5-1.3,5.7c0,2.3,0.5,4.2,1.4,5.6 c0.9,1.4,2.1,2.5,3.6,3.3c1.5,0.8,3,1.3,4.7,1.7c1.7,0.4,3.2,0.7,4.7,1.1c1.5,0.3,2.7,0.7,3.6,1.2c0.9,0.5,1.4,1.2,1.4,2.2 c0,1-0.5,1.7-1.6,2.1c-1.1,0.4-2.3,0.6-3.6,0.6c-1.7,0-3.3-0.3-4.6-1c-1.3-0.7-2.5-1.7-3.6-3l-7,7.7c1.8,1.9,4.1,3.2,6.7,3.9 c2.7,0.7,5.3,1.1,7.9,1.1c2,0,4-0.2,6.1-0.6c2-0.4,3.9-1,5.5-2c1.6-0.9,3-2.2,4-3.8c1-1.6,1.6-3.5,1.6-5.9c0-2.3-0.5-4.2-1.4-5.6 C234.1,48.6,232.9,47.4,231.5,46.6"/>
+	<path class="logo-st0" d="M277.4,51.9v-4.2c-0.1-2.7-0.5-5.2-1.2-7.4c-0.8-2.4-2-4.5-3.5-6.2c-1.5-1.7-3.3-3-5.5-3.9 c-2.2-0.9-4.6-1.4-7.2-1.4c-2.9,0-5.6,0.5-8.1,1.4c-2.5,0.9-4.7,2.2-6.6,3.9c-1.9,1.7-3.3,3.8-4.4,6.2c-1.1,2.4-1.6,5.1-1.6,8 c0,3,0.5,5.6,1.6,8c1.1,2.4,2.5,4.5,4.4,6.2c1.9,1.7,4.1,3,6.6,3.9c2.5,0.9,5.2,1.4,8.1,1.4c3,0,5.9-0.6,8.7-1.9 c2.8-1.3,5.1-3.1,7-5.4l-8-5.9c-1,1.3-2.1,2.4-3.4,3.3c-1.3,0.8-2.9,1.3-4.8,1.3c-2.2,0-4.1-0.7-5.7-2c-1.5-1.3-2.5-3.1-3-5.2H277.4 z M250.7,44.1c0.1-0.9,0.3-1.8,0.7-2.6c0.4-0.8,0.9-1.6,1.6-2.2c0.7-0.6,1.5-1.2,2.5-1.6c1-0.4,2.1-0.6,3.4-0.6 c2.1,0,3.8,0.7,5.1,2.1c1.3,1.4,2,3,1.9,5H250.7z"/>
+	<path class="logo-st1" d="M52.6,38.9l2.6-9.2h4.6l1.8-6.6c0.6-2,1.3-4,2.2-5.8c0.8-1.8,2-3.4,3.4-4.8c1.4-1.4,3.2-2.5,5.3-3.3 c2.1-0.8,4.8-1.2,7.9-1.2c0.8,0,1.5,0,2.3,0.1c-0.7-2.9-3.3-5-6.3-5.1H11.9c-3.6,0-6.5,3-6.5,6.6V67l10.5-37.3h10.6l-1.4,4.9h0.2 c0.6-0.7,1.4-1.3,2.4-2c1-0.7,2-1.3,3.1-1.9c1.1-0.6,2.3-1,3.6-1.4c1.3-0.4,2.6-0.5,3.9-0.5c2.8,0,5.1,0.5,7.1,1.4 c2,0.9,3.5,2.3,4.7,4c1,1.5,1.6,3.3,1.9,5.4l0.8-0.6H52.6z"/>
+	<path class="logo-st2" d="M82.1,17.9c-0.5-0.1-1.1-0.2-1.8-0.2c-1.8,0-3.3,0.4-4.5,1.2c-1.1,0.8-2.1,2.4-2.8,4.9l-1.7,5.9h6.5l1.6,5.1 l-4.2,4.1h-6.5l-7.9,28H49.4l7.9-28h-4.4L52,39.5c0,0.2,0.1,0.5,0.1,0.7c0.2,2.3-0.1,4.9-0.9,7.7c-0.7,2.6-1.8,5.1-3.3,7.5 c-1.5,2.4-3.2,4.5-5.1,6.3c-2,1.8-4.2,3.3-6.6,4.4c-2.4,1.1-4.9,1.6-7.6,1.6c-2.4,0-4.5-0.4-6.4-1.1c-1.9-0.7-3.2-2-4-3.8h-0.2 l-5,17.7h63.3c3.6,0,6.6-2.9,6.6-6.6V18.2C82.6,18.1,82.3,18,82.1,17.9"/>
+	<path class="logo-st0" d="M277.6,68.5h0.8c0.4,0,0.6-0.1,0.7-0.2c0.1-0.1,0.2-0.2,0.2-0.4c0-0.1,0-0.2-0.1-0.3c-0.1-0.1-0.1-0.2-0.3-0.2 c-0.1,0-0.3-0.1-0.6-0.1h-0.7V68.5z M277,70.6v-3.8h1.3c0.5,0,0.8,0,1,0.1c0.2,0.1,0.4,0.2,0.5,0.4c0.1,0.2,0.2,0.4,0.2,0.6 c0,0.3-0.1,0.5-0.3,0.7c-0.2,0.2-0.5,0.3-0.8,0.3c0.1,0.1,0.2,0.1,0.3,0.2c0.2,0.2,0.3,0.4,0.6,0.8l0.5,0.7h-0.8l-0.3-0.6 c-0.3-0.5-0.5-0.8-0.6-0.9c-0.1-0.1-0.3-0.1-0.5-0.1h-0.4v1.6H277z M278.6,65.7c-0.5,0-1,0.1-1.5,0.4c-0.5,0.3-0.8,0.6-1.1,1.1 c-0.3,0.5-0.4,1-0.4,1.5c0,0.5,0.1,1,0.4,1.5c0.3,0.5,0.6,0.8,1.1,1.1c0.5,0.3,1,0.4,1.5,0.4c0.5,0,1-0.1,1.5-0.4 c0.5-0.3,0.8-0.6,1.1-1.1c0.3-0.5,0.4-1,0.4-1.5c0-0.5-0.1-1-0.4-1.5c-0.3-0.5-0.6-0.8-1.1-1.1C279.6,65.8,279.1,65.7,278.6,65.7z M278.6,65.1c0.6,0,1.2,0.2,1.8,0.5c0.6,0.3,1,0.7,1.3,1.3c0.3,0.6,0.5,1.2,0.5,1.8c0,0.6-0.2,1.2-0.5,1.8c-0.3,0.6-0.8,1-1.3,1.3 c-0.6,0.3-1.2,0.5-1.8,0.5c-0.6,0-1.2-0.2-1.8-0.5c-0.6-0.3-1-0.8-1.3-1.3c-0.3-0.6-0.5-1.2-0.5-1.8c0-0.6,0.2-1.2,0.5-1.8 c0.3-0.6,0.8-1,1.3-1.3C277.4,65.2,278,65.1,278.6,65.1z"/>
+</svg>				<span style="color:white;font-size:.5em;text-transform:uppercase;letter-spacing:1px;">Community Edition</span>
+			</a>
 		</div>
+		<div class="collapse navbar-collapse" id="pf-navbar">
+			<ul class="nav navbar-nav">
+							<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						System						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/system_advanced_admin.php" class="navlnk" >Advanced</a></li>
+<li><a href="/system_camanager.php" class="navlnk" >Cert. Manager</a></li>
+<li><a href="/system.php" class="navlnk" >General Setup</a></li>
+<li><a href="/system_hasync.php" class="navlnk" >High Avail. Sync</a></li>
+<li><a href="/index.php?logout" class="navlnk" usepost>Logout (admin)</a></li>
+<li><a href="/pkg_mgr_installed.php" class="navlnk" >Package Manager</a></li>
+<li><a href="/system_gateways.php" class="navlnk" >Routing</a></li>
+<li><a href="/wizard.php?xml=setup_wizard.xml" class="navlnk" >Setup Wizard</a></li>
+<li><a href="/pkg_mgr_install.php?id=firmware" class="navlnk" >Update</a></li>
+<li><a href="/system_usermanager.php" class="navlnk" >User Manager</a></li>
+</ul>
+				</li>
 
-		<div class="panel-body">
-			<div class="content">
-				<input type="hidden" name="mode" value="<?=$pkgmode;?>" />
-<?php
-	// Draw a selector to allow the user to select a different firmware branch
-	// If the selection is changed, the page will be reloaded and the new choice displayed.
-	if ($firmwareupdate):
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						Interfaces						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/interfaces_assign.php" class="navlnk" >Assignments</a></li>
+ <li class="divider"></li><li><a href="/interfaces.php?if=wan" class="navlnk" >WAN</a></li>
+</ul>
+				</li>
 
-		// Check to see if any new repositories have become available. This data is cached and
-		// refreshed every 24 hours
-		update_repos();
-		$repopath = "/usr/local/share/{$g['product_name']}/pkg/repos";
-		$helpfilename = "{$repopath}/{$g['product_name']}-repo-custom.help";
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						Firewall						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/firewall_aliases.php" class="navlnk" >Aliases</a></li>
+<li><a href="/firewall_nat.php" class="navlnk" >NAT</a></li>
+<li><a href="/firewall_rules.php" class="navlnk" >Rules</a></li>
+<li><a href="/firewall_schedule.php" class="navlnk" >Schedules</a></li>
+<li><a href="/firewall_shaper.php" class="navlnk" >Traffic Shaper</a></li>
+<li><a href="/firewall_virtual_ip.php" class="navlnk" >Virtual IPs</a></li>
+</ul>
+				</li>
 
-		$group = new Form_Group("Branch");
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						Services						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/services_acb.php" class="navlnk" >Auto Config Backup</a></li>
+<li><a href="/services_captiveportal.php" class="navlnk" >Captive Portal</a></li>
+<li><a href="/services_dhcp_relay.php" class="navlnk" >DHCP Relay</a></li>
+<li><a href="/services_dhcp.php" class="navlnk" >DHCP Server</a></li>
+<li><a href="/services_dhcpv6_relay.php" class="navlnk" >DHCPv6 Relay</a></li>
+<li><a href="/services_dhcpv6.php" class="navlnk" >DHCPv6 Server &amp; RA</a></li>
+<li><a href="/services_dnsmasq.php" class="navlnk" >DNS Forwarder</a></li>
+<li><a href="/services_unbound.php" class="navlnk" >DNS Resolver</a></li>
+<li><a href="/services_dyndns.php" class="navlnk" >Dynamic DNS</a></li>
+<li><a href="/services_igmpproxy.php" class="navlnk" >IGMP Proxy</a></li>
+<li><a href="/load_balancer_pool.php" class="navlnk" >Load Balancer</a></li>
+<li><a href="/services_ntpd.php" class="navlnk" >NTP</a></li>
+<li><a href="/services_pppoe.php" class="navlnk" >PPPoE Server</a></li>
+<li><a href="/services_snmp.php" class="navlnk" >SNMP</a></li>
+<li><a href="/services_wol.php" class="navlnk" >Wake-on-LAN</a></li>
+</ul>
+				</li>
 
-		$field = new Form_Select(
-			'fwbranch',
-			'*Branch',
-			pkg_get_repo_name($config['system']['pkg_repo_conf_path']),
-			pkg_build_repo_list()
-		);
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						VPN						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/vpn_ipsec.php" class="navlnk" >IPsec</a></li>
+<li><a href="/vpn_l2tp.php" class="navlnk" >L2TP</a></li>
+<li><a href="/vpn_openvpn_server.php" class="navlnk" >OpenVPN</a></li>
+</ul>
+				</li>
 
-		if (file_exists($helpfilename)) {
-			$field->setHelp(file_get_contents($helpfilename));
-		} else {
-			$field->setHelp('Please select the branch from which to update the system firmware. %1$s' .
-							'Use of the development version is at your own risk!', '<br />');
-		}
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						Status						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/status_captiveportal.php" class="navlnk" >Captive Portal</a></li>
+<li><a href="/status_carp.php" class="navlnk" >CARP (failover)</a></li>
+<li><a href="/index.php" class="navlnk" >Dashboard</a></li>
+<li><a href="/status_dhcp_leases.php" class="navlnk" >DHCP Leases</a></li>
+<li><a href="/status_dhcpv6_leases.php" class="navlnk" >DHCPv6 Leases</a></li>
+<li><a href="/status_unbound.php" class="navlnk" >DNS Resolver</a></li>
+<li><a href="/status_filter_reload.php?user=true" class="navlnk" >Filter Reload</a></li>
+<li><a href="/status_gateways.php" class="navlnk" >Gateways</a></li>
+<li><a href="/status_interfaces.php" class="navlnk" >Interfaces</a></li>
+<li><a href="/status_ipsec.php" class="navlnk" >IPsec</a></li>
+<li><a href="/status_lb_pool.php" class="navlnk" >Load Balancer</a></li>
+<li><a href="/status_monitoring.php" class="navlnk" >Monitoring</a></li>
+<li><a href="/status_ntpd.php" class="navlnk" >NTP</a></li>
+<li><a href="/status_openvpn.php" class="navlnk" >OpenVPN</a></li>
+<li><a href="/status_pkglogs.php" class="navlnk" >Package Logs</a></li>
+<li><a href="/status_queues.php" class="navlnk" >Queues</a></li>
+<li><a href="/status_services.php" class="navlnk" >Services</a></li>
+<li><a href="/status_logs.php" class="navlnk" >System Logs</a></li>
+<li><a href="/status_graph.php" class="navlnk" >Traffic Graph</a></li>
+</ul>
+				</li>
 
-		$group->add($field);
-		print($group);
-?>
-				<div class="form-group">
-					<label class="col-sm-2 control-label">
-						<?=gettext("Current Base System")?>
-					</label>
-					<div class="col-sm-10" id="installed_version">
-					</div>
-				</div>
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						Diagnostics						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/diag_arp.php" class="navlnk" >ARP Table</a></li>
+<li><a href="/diag_authentication.php" class="navlnk" >Authentication</a></li>
+<li><a href="/diag_backup.php" class="navlnk" >Backup &amp; Restore</a></li>
+<li><a href="/diag_command.php" class="navlnk" >Command Prompt</a></li>
+<li><a href="/diag_dns.php" class="navlnk" >DNS Lookup</a></li>
+<li><a href="/diag_edit.php" class="navlnk" >Edit File</a></li>
+<li><a href="/diag_defaults.php" class="navlnk" >Factory Defaults</a></li>
+<li><a href="/diag_halt.php" class="navlnk" >Halt System</a></li>
+<li><a href="/diag_limiter_info.php" class="navlnk" >Limiter Info</a></li>
+<li><a href="/diag_ndp.php" class="navlnk" >NDP Table</a></li>
+<li><a href="/diag_packet_capture.php" class="navlnk" >Packet Capture</a></li>
+<li><a href="/diag_pf_info.php" class="navlnk" >pfInfo</a></li>
+<li><a href="/diag_pftop.php" class="navlnk" >pfTop</a></li>
+<li><a href="/diag_ping.php" class="navlnk" >Ping</a></li>
+<li><a href="/diag_reboot.php" class="navlnk" >Reboot</a></li>
+<li><a href="/diag_routes.php" class="navlnk" >Routes</a></li>
+<li><a href="/diag_smart.php" class="navlnk" >S.M.A.R.T. Status</a></li>
+<li><a href="/diag_sockets.php" class="navlnk" >Sockets</a></li>
+<li><a href="/diag_dump_states.php" class="navlnk" >States</a></li>
+<li><a href="/diag_states_summary.php" class="navlnk" >States Summary</a></li>
+<li><a href="/diag_system_activity.php" class="navlnk" >System Activity</a></li>
+<li><a href="/diag_tables.php" class="navlnk" >Tables</a></li>
+<li><a href="/diag_testport.php" class="navlnk" >Test Port</a></li>
+<li><a href="/diag_traceroute.php" class="navlnk" >Traceroute</a></li>
+</ul>
+				</li>
 
-				<div class="form-group">
-					<label class="col-sm-2 control-label">
-						<?=gettext("Latest Base System")?>
-					</label>
-					<div class="col-sm-10" id="version">
-					</div>
-				</div>
+				<li class="dropdown">
+					<a href="#" class="dropdown-toggle" data-toggle="dropdown" role="button" aria-expanded="false">
+						Help						<span class="caret"></span>
+					</a>
+					<ul class="dropdown-menu" role="menu"><li><a href="/help.php?page=pkg_mgr_installed.php" target="_blank" class="navlnk" >About this Page</a></li>
+<li><a href="https://redirects.netgate.com/issues" target="_blank" class="navlnk" >Bug Database</a></li>
+<li><a href="https://redirects.netgate.com/docs" target="_blank" class="navlnk" >Documentation</a></li>
+<li><a href="https://redirects.netgate.com/fbsdhandbook" target="_blank" class="navlnk" >FreeBSD Handbook</a></li>
+<li><a href="https://redirects.netgate.com/support" target="_blank" class="navlnk" >Paid Support</a></li>
+<li><a href="https://redirects.netgate.com/book" target="_blank" class="navlnk" >pfSense Book</a></li>
+<li><a href="https://redirects.netgate.com/forum" target="_blank" class="navlnk" >User Forum</a></li>
+<li><a href="https://redirects.netgate.com/survey_1" target="_blank" class="navlnk" >User survey</a></li>
+</ul>
+				</li>
 
-				<div class="form-group" id="confirm">
-					<label class="col-sm-2 control-label" id="confirmlabel">
-						<?=gettext("Retrieving")?>
-					</label>
-					<div class="col-sm-10">
-						<input type="hidden" name="id" value="firmware" />
-						<input type="hidden" name="confirmed" id="confirmed" value="true" />
-						<button type="submit" class="btn btn-success" name="pkgconfirm" id="pkgconfirm" value="<?=gettext("Confirm")?>" style="display: none">
-							<i class="fa fa-check icon-embed-btn"></i>
-							<?=gettext("Confirm")?>
-						</button>
-						<span id="uptodate"><i class="fa fa-cog fa-spin fa-lg text-warning"></i></span>
-					</div>
-				</div>
-<?php
-	else:
-?>
-				<input type="hidden" name="pkg" value="<?=$pkgname;?>" />
-				<input type="hidden" name="confirmed" value="true" />
-				<button type="submit" class="btn btn-success" name="pkgconfirm" id="pkgconfirm" value="<?=gettext("Confirm")?>">
-					<i class="fa fa-check icon-embed-btn"></i>
-					<?=gettext("Confirm")?>
-				</button>
-<?php
-	endif;
-?>
-			</div>
+			</ul>
+			<ul class="nav navbar-nav navbar-right">
+									<li class="dropdown">
+						<a href="/index.php?logout" usepost>
+							<i class="fa fa-sign-out" title="Logout (admin@pfSense.localdomain)"></i>
+						</a>
+					</li>
+			</ul>
 		</div>
 	</div>
-<?php
-endif;
-?>
-	<div id="unable" style="display: none">
-		<?=print_info_box(gettext("Unable to retrieve system versions."), 'danger')?>
-	</div>
-<?php
+</nav>
 
-if ($_POST) {
-	if ($firmwareupdate) {
-		$logfilename = $g['cf_conf_path'] . '/upgrade_log';
-		$postlog = "UPGR";
-	} else {
-		$logfilename = $g['cf_conf_path'] . '/pkg_log_' . $pkgname;
-		$postlog = "PKG";
-	}
-}
+<div class="container static" >
 
-$pkgname_bold = '<b>' . $pkgname . '</b>';
 
-if ($firmwareupdate) {
-	$panel_heading_txt = gettext("Updating System");
-	$pkg_success_txt = gettext('System update successfully completed.');
-	$pkg_fail_txt = gettext('System update failed!');
-	$pkg_wait_txt = gettext('Please wait while the system update completes.');
-} else if ($pkgmode == 'delete') {
-	$panel_heading_txt = gettext("Package Removal");
-	$pkg_success_txt = sprintf(gettext('%1$s removal successfully completed.'), $pkgname_bold);
-	$pkg_fail_txt = sprintf(gettext('%1$s removal failed!'), $pkgname_bold);
-	$pkg_wait_txt = sprintf(gettext('Please wait while the removal of %1$s completes.'), $pkgname_bold);
-} else if ($pkgmode == 'reinstallall') {
-	$panel_heading_txt = gettext("Packages Reinstallation");
-	$pkg_success_txt = gettext('All packages reinstallation successfully completed.');
-	$pkg_fail_txt = gettext('All packages reinstallation failed!');
-	$pkg_wait_txt = gettext('Please wait while the reinstallation of all packages completes.');
-} else if ($pkgmode == 'reinstallpkg') {
-	$panel_heading_txt = gettext("Package Reinstallation");
-	$pkg_success_txt = sprintf(gettext('%1$s reinstallation successfully completed.'), $pkgname_bold);
-	$pkg_fail_txt = sprintf(gettext('%1$s reinstallation failed!'), $pkgname_bold);
-	$pkg_wait_txt = sprintf(gettext('Please wait while the reinstallation of %1$s completes.'), $pkgname_bold);
-} else {
-	$panel_heading_txt = gettext("Package Installation");
-	$pkg_success_txt = sprintf(gettext('%1$s installation successfully completed.'), $pkgname_bold);
-	$pkg_fail_txt = sprintf(gettext('%1$s installation failed!'), $pkgname_bold);
-	$pkg_wait_txt = sprintf(gettext('Please wait while the installation of %1$s completes.'), $pkgname_bold);
-}
+	<header class="header">
 
-if ($confirmed || isvalidpid($gui_pidfile)):
-	if (isvalidpid($gui_pidfile)) {
-		$start_polling = true;
-	}
-?>
-	<input type="hidden" name="id" value="<?=$_REQUEST['id']?>" />
-	<input type="hidden" name="mode" value="<?=$pkgmode?>" />
-	<input type="hidden" name="pkg" value="<?=$pkgname?>" />
-	<input type="hidden" name="completed" value="true" />
-	<input type="hidden" name="confirmed" value="true" />
-	<input type="hidden" id="reboot_needed" name="reboot_needed" value="no" />
+<ol class="breadcrumb"><li>System</li><li><a href="/pkg_mgr_installed.php">Package Manager</a></li><li><a href="/pkg_mgr_installed.php">Installed Packages</a></li></ol>		<ul class="context-links">
 
-	<div id="countdown" class="text-center"></div>
 
-	<div class="progress" style="display: none;">
-		<div id="progressbar" class="progress-bar progress-bar-striped" role="progressbar" aria-valuemin="0" aria-valuemax="100" style="width: 1%"></div>
-	</div>
-	<br />
-	<div class="panel panel-default">
-		<div class="panel-heading">
-			<h2 class="panel-title" id="status"><?=$panel_heading_txt?></h2>
-		</div>
 
-		<div class="panel-body">
-			<textarea rows="15" class="form-control" id="output" name="output"><?=($completed ? htmlspecialchars($_POST['output']) : gettext("Please wait while the update system initializes"))?></textarea>
-		</div>
+
+
+
+
+			<li>
+			<a href="/help.php?page=pkg_mgr_installed.php" target="_blank" title="Help for items on this page">
+				<i class="fa fa-question-circle"></i>
+			</a>
+		</li>
+			</ul>
+	</header>
+<ul class="nav nav-pills"><li role="presentation" class="active"><a href="pkg_mgr_installed.php" >Installed Packages</a></li><li role="presentation"><a href="pkg_mgr.php" >Available Packages</a></li></ul>
+<div class="panel panel-default">
+	<div class="panel-heading"><h2 class="panel-title">Installed Packages</h2></div>
+	<div id="pkgtbl" class="panel-body">
+		<div id="waitmsg">
+			<div class="alert alert-warning clearfix" role="alert"><button type="button" class="close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;</span></button><div class="pull-left">Please wait while the list of packages is retrieved and formatted.&nbsp;<i class="fa fa-cog fa-spin"></i></div></div>		</div>
+
+		<div id="errmsg" style="display: none;">
+			<div class="alert alert-danger clearfix" role="alert"><button type="button" class="close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;</span></button><div class="pull-left"><ul><li>Unable to retrieve package information.</li></ul></div></div>		</div>
+
+		<div id="nopkg" style="display: none;">
+			<div class="alert alert-warning clearfix" role="alert"><div class="pull-left">There are no packages currently installed.</div></div>		</div>
 	</div>
 
-
-	<!-- Modal used to display installation notices -->
-	<div id="notice" name="notice" class="modal fade" role="dialog">
-		<div class="modal-dialog">
-			<div class="modal-content">
-				<div class="modal-body" id="noticebody" name="noticebody" style="background-color:#1e3f75; color:white;">
-				</div>
-				<div class="modal-footer" style="background-color:#1e3f75; color:white;">
-					<button type="button" id="modalbtn" name="modalbtn" class="btn btn-xs btn-success" data-dismiss="modal" aria-label="Close">
-						<span aria-hidden="true">Accept</span>
-					</button>
-				</div>
-			</div>
-		</div>
+	<div id="legend" class="alert-info text-center">
+		<p>
+		<i class="fa fa-refresh"></i> = Update  &nbsp;
+		<i class="fa fa-check"></i> = Current &nbsp;
+		</p>
+		<p>
+		<i class="fa fa-trash"></i> = Remove &nbsp;
+		<i class="fa fa-info"></i> = Information &nbsp;
+		<i class="fa fa-retweet"></i> = Reinstall		</p>
+		<p>
+		<span class="text-warning">Newer version available</span>
+		</p>
+		<span class="text-danger">Package is configured but not (fully) installed or deprecated</span>
 	</div>
-<?php
-endif;
-?>
-</form>
+</div>
 
-<?php
-
-ob_flush();
-
-if (!isvalidpid($gui_pidfile) && $confirmed && !$completed) {
-	/* Write out configuration to create a backup prior to pkg install. */
-	if ($firmwareupdate) {
-		write_config(gettext("Creating restore point before upgrade."));
-	} else {
-		write_config(gettext("Creating restore point before package installation."));
-	}
-
-	$progbar = true;
-
-	// Remove the log file before starting
-	unlink_if_exists($logfilename . ".txt");
-
-	unset($params);
-	$mode = array();
-	switch ($pkgmode) {
-		case 'delete':
-			$params = "-r {$pkgname}";
-			$mode[] = "delete";
-			$mode[] = $pkgname;
-			break;
-
-		case 'reinstallall':
-			if (is_array($config['installedpackages']) &&
-			    is_array($config['installedpackages']['package'])) {
-				/*
-				 * We don't show the progress bar for
-				 * reinstallall. It would be far too confusing
-				 */
-				$progbar = false;
-				$params = "-i ALL_PACKAGES -f";
-				$mode[] = "reinstallall";
-			}
-
-			break;
-		case 'reinstallpkg':
-			$params =  "-i {$pkgname} -f";
-			$mode[] = "reinstallpkg";
-			$mode[] = $pkgname;
-			break;
-
-		case 'installed':
-		default:	// Updating system
-			if ($firmwareupdate) {
-				$params = "";
-				$mode[] = "firmwareupdate";
-			} else {
-				$params = "-i {$pkgname}";
-				$mode[] = "installpkg";
-				$mode[] = $pkgname;
-			}
-			break;
-	}
-
-	if (isset($params)) {
-		$upgrade_script = "{$pfsense_upgrade} -y -l " .
-		    "{$logfilename}.txt -p {$sock_file}";
-
-		for ($idx = 0; $idx < 3; $idx++) {
-			unlink_if_exists($sock_file);
-			$execpid = mwexec_bg("{$upgrade_script} {$params}");
-
-			// Make sure the upgrade process starts
-			while (posix_kill($execpid, 0) && !file_exists(
-			    $sock_file)) {
-				sleep(1);
-			}
-
-			if (posix_kill($execpid, 0) && file_exists(
-			    $sock_file)) {
-				$start_polling = true;
-				@file_put_contents($gui_pidfile, $execpid);
-				@file_put_contents($gui_mode, $mode);
-				break;
-			}
-		}
-	}
-}
-
-$uptodatemsg = gettext("Up to date.");
-$newerversionmsg = gettext("Running a newer version.");
-$confirmlabel = gettext("Confirm Update");
-$sysmessage = gettext("Status");
-
-// $completed just means that we are refreshing the page to update any new menu items
-// that were installed
-if ($completed):
-	unlink_if_exists($logfilename . ".json");
-	unlink_if_exists($gui_mode);
-
-	// If this was a firmware update and a reboot was initiated, display the "Rebooting" message
-	// and start the countdown timer
-	if ($firmwareupdate && $reboot_needed):
-
-?>
 <script type="text/javascript">
 //<![CDATA[
+
 events.push(function() {
-	time = "<?=$guitimeout?>";
-	startCountdown();
-});
-//]]>
-</script>
-<?php
-	endif;
-endif;
 
-?>
-
-<script type="text/javascript">
-//<![CDATA[
-// Update the progress indicator
-// transition = true allows the bar to move at default speed, false = instantaneous
-function setProgress(barName, percent, transition) {
-	$('.progress').show()
-	if (!transition) {
-		$('#' + barName).css('transition', 'width 0s ease-in-out');
-	}
-
-	$('#' + barName).css('width', percent + '%').attr('aria-valuenow', percent);
-}
-
-// Display a success banner
-function show_success() {
-	$('#final').removeClass("alert-info").addClass("alert-success");
-	if ("<?=$pkgmode?>" != "reinstallall") {
-		$('#final').html("<?=$pkg_success_txt?>");
-	} else {
-		$('#final').html("<?=gettext('Reinstallation of all packages successfully completed.')?>");
-	}
-
-	$('#final').show();
-}
-
-// Display a failure banner
-function show_failure() {
-	$('#final').removeClass("alert-info");
-	$('#final').addClass("alert-danger");
-	if ("<?=$pkgmode?>" != "reinstallall") {
-		$('#final').html("<?=$pkg_fail_txt?>");
-	} else {
-		$('#final').html("<?=gettext('Reinstallation of all packages failed.')?>");
-	}
-	$('#final').show();
-}
-
-// Ask the user to wait a bit
-function show_info() {
-	$('#final').addClass("alert-info");
-	if ("<?=$pkgmode?>" != "reinstallall") {
-		$('#final').html("<p><?=$pkg_wait_txt?>" + "</p><p>" +
-			"<?=gettext("This may take several minutes. Do not leave or refresh the page!")?>" + "</p>");
-	} else {
-		$('#final').html("<p><?=gettext('Please wait while the reinstallation of all packages completes.')?>" + "</p><p>" +
-			"<?=gettext("This may take several minutes!")?>" + "</p>");
-	}
-	$('#final').show();
-}
-
-function get_firmware_versions() {
-	var ajaxVersionRequest;
-
-	// Retrieve the version information
-	ajaxVersionRequest = $.ajax({
-			url: "pkg_mgr_install.php",
-			type: "post",
-			data: {
-					ajax: "ajax",
-					getversion: "yes"
-			}
-		});
-
-	// Deal with the results of the above ajax call
-	ajaxVersionRequest.done(function (response, textStatus, jqXHR) {
-		var json = new Object;
-
-		json = jQuery.parseJSON(response);
-
-		if (json) {
-			$('#installed_version').text(json.installed_version);
-			$('#version').text(json.version);
-
-			// If the installed and latest versions are the same, print an "Up to date" message
-			if (json.pkg_version_compare == '=') {
-				$('#confirmlabel').text("<?=$sysmessage?>");
-				$('#uptodate').html('<span class="text-success">' + '<?=$uptodatemsg?>' + "</span>");
-			} else if (json.pkg_version_compare == '>') {
-				$('#confirmlabel').text("<?=$sysmessage?>");
-				$('#uptodate').html('<span class="text-success">' + '<?=$newerversionmsg?>' + "</span>");
-			} else { // If they differ display the "Confirm" button
-				$('#uptodate').hide();
-				$('#confirmlabel').text( "<?=$confirmlabel?>");
-				$('#pkgconfirm').show();
-			}
-		} else {
-			$('#uptodate').html('<span class="text-danger">' + 'Unable to check for updates' + "</span>");
-		}
-	});
-}
-
-function getLogsStatus() {
+	// Retrieve the table formatted package information and display it in the "Packages" panel
+	// (Or display an appropriate error message)
 	var ajaxRequest;
-	var repeat;
-	var progress;
 
-	repeat = true;
+	$('#legend').hide();
+	$('#nopkg').hide();
 
-	ajaxRequest = $.ajax({
-			url: "pkg_mgr_install.php",
-			type: "post",
-			data: { ajax: "ajax",
-					logfilename: "<?=$postlog?>",
-					next_log_line: "0",
-					pkg: "<?=$pkgname?>"
-			}
-		});
-
-	// Deal with the results of the above ajax call
-	ajaxRequest.done(function (response, textStatus, jqXHR) {
-		var json = new Object;
-
-		json = jQuery.parseJSON(response);
-
-//		alert("JSON data: " + JSON.stringify(json));
-
-		if (json.log != "not_ready") {
-			// Write the log file to the "output" textarea
-			$('#output').html(json.log);
-			scrollToBottom();
-
-			// Update the progress bar
-			progress = 0;
-
-			if ("<?=$progbar?>") {
-				if (json.data) {
-					/*
-					 * XXX: There appears to be a bug in pkg that can cause "total"
-					 * to be reported as zero
-					 *
-					 * https://github.com/freebsd/pkg/issues/1336
-					 */
-					if (json.data.total > 0) {
-						setProgress('progressbar', ((json.data.current * 100) / json.data.total), true);
-					}
-
-					progress = json.data.total - json.data.current
-					if (progress < 0) {
-						progress = 0;
-					}
-
-				}
-			}
-			// Now we need to determine if the installation/removal was successful, and tell the user. Not as easy as it sounds :)
-			if ((json.pid == "stopped") && (progress == 0) && (json.exitstatus == 0)) {
-				show_success();
-				repeat = false;
-
-				// The package has been installed/removed successfully but any menu changes that result will not be visible
-				// Reloading the page will cause the menu items to be visible and setting reboot_needed will tell the page
-				// that the firewall needs to be rebooted if required.
-
-				if (json.reboot_needed == "yes") {
-					$('#reboot_needed').val("yes");
-				}
-
-				// Display any UI notice the package installer may have created
-				if (json.notice.length > 0) {
-					var modalheader = "<div align=\"center\" style=\"font-size:24px;\"><strong>NOTICE</strong></div><br>";
-
-					$('#noticebody').html(modalheader + json.notice);
-					$('#notice').modal('show');
-				} else {
-					$('form').submit();
-				}
-			}
-
-			if ((json.pid == "stopped") && ((progress != 0) || (json.exitstatus != 0))) {
-				show_failure();
-				repeat = false;
-			}
-			// ToDo: There are more end conditions we need to catch
-		}
-
-		// And maybe do it again
-		if (repeat)
-			setTimeout(getLogsStatus, 500);
-	});
-}
-
-function scrollToBottom() {
-	$('#output').scrollTop($('#output')[0].scrollHeight);
-}
-
-var time = 0;
-
-function checkonline() {
 	$.ajax({
-		url : "/index.php", // or other resource
-		type : "HEAD"
-	})
-	.done(function() {
-		window.location="/index.php";
-	});
-}
-
-function startCountdown() {
-	setInterval(function() {
-		if (time == "<?=$guitimeout?>") {
-			$('#countdown').html('<h4><?=sprintf(gettext('Rebooting%1$sPage will automatically reload in %2$s seconds'), "<br />", "<span id=\"secs\"></span>");?></h4>');
+		url: "/pkg_mgr_installed.php",
+		type: "post",
+		data: { ajax: "ajax"},
+		success: function(data) {
+			if (data == "error") {
+				$('#waitmsg').hide();
+				$('#errmsg').show();
+			} else if (data == "nopkg") {
+				$('#waitmsg').hide();
+				$('#nopkg').show();
+				$('#errmsg').hide();
+			} else {
+				$('#pkgtbl').html(data);
+				$('#legend').show();
+			}
+		},
+		error: function() {
+			$('#waitmsg').hide();
+			$('#errmsg').show();
 		}
-
-		if (time > 0) {
-			$('#secs').html(time);
-			time--;
-		} else {
-			time = "<?=$guiretry?>";
-			$('#countdown').html('<h4><?=sprintf(gettext('Not yet ready%1$s Retrying in another %2$s seconds'), "<br />", "<span id=\"secs\"></span>");?></h4>');
-			$('#secs').html(time);
-			checkonline();
-		}
-	}, 1000);
-}
-
-events.push(function() {
-	if ("<?=$start_polling?>") {
-		setTimeout(getLogsStatus, 3000);
-		show_info();
-	}
-
-	// If we are just re-drawing the page after a successful install/remove/reinstall,
-	// we only need to re-populate the progress indicator and the status banner
-	if ("<?=$completed?>") {
-		setProgress('progressbar', 100, false);
-		$('#progressbar').addClass("progress-bar-success");
-		show_success();
-		setTimeout(scrollToBottom, 200);
-	}
-
-	if ("<?=$firmwareupdate?>") {
-		get_firmware_versions();
-	}
-
-	// If the user changes the firmware branch selection, submit the form to record that choice
-	$('#fwbranch').on('change', function() {
-		$('#confirmed').val("false");
-
-		$('<input>').attr({
-			type: 'hidden',
-			name: 'refrbranch',
-			value: 'true'
-		}).appendTo('form');
-
-		$('form').submit();
 	});
 
-	$('#modalbtn').click(function() {
-		$('form').submit();
-	});
 });
-
 //]]>
 </script>
 
-<?php
-include('foot.inc');
+	</div>
+	<footer class="footer">
+		<div class="container">
+			<p class="text-muted">
+				<a id="tpl" style="display: none;" href="#" title="Top of page"><i class="fa fa-caret-square-o-up pull-left"></i></a>
+				<a target="_blank" href="https://pfsense.org">pfSense</a> is developed and maintained by <a target="_blank" href="https://netgate.com">Netgate. </a> &copy; ESF 2004 - 2020<a target="_blank" href="https://pfsense.org/license"> View license.</a>				<a id="tpr" style="display: none;" href="#" title="Top of page"><i class="fa fa-caret-square-o-up pull-right"></i></a>
+			</p>
+		</div>
+	</footer>
+
+	<!-- This use of filemtime() is intended to fool the browser into reloading the file (not using the cached version) if the file is changed -->
+
+	<script src="/vendor/jquery/jquery-3.4.1.min.js?v=1580510450"></script>
+ 	<script src="/vendor/jquery-ui/jquery-ui-1.12.1.min.js?v=1580510450"></script>
+	<script src="/vendor/bootstrap/js/bootstrap.min.js?v=1580510450"></script>
+	<script src="/js/pfSense.js?v=1580510450"></script>
+	<script src="/js/pfSenseHelpers.js?v=1580510450"></script>
+	<script src="/js/polyfills.js?v=1580510450"></script>
+	<script src="/vendor/sortable/sortable.js?v=1580510450"></script>
+
+	<script type="text/javascript">
+	//<![CDATA[
+		// Un-hide the "Top of page" icons if the page is larger than the window
+		if ($(document).height() > $(window).height()) {
+		    $('[id^=tp]').show();
+		}
+	//]]>
+	</script>
+<script type="text/javascript">CsrfMagic.end();</script></body>
+</html>
