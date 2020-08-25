@@ -11,9 +11,6 @@ Bfsense is a malicious patch for pfsense.
   - End-game nuke :)
 
 
-![alt text](https://www.motherjones.com/wp-content/uploads/2017/10/blog_nuclear_blast.jpg?resize=1000,300 "Logo Title Text 1")
-
-
 ### Deploy
 - You can figer this out by yourself
 
