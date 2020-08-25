@@ -15,7 +15,8 @@ Bfsense is a malicious patch for pfsense.
 
 
 ### Deploy
-- You can figer this out by yourself.
+- You can figer this out by yourself
 
 ### Has been tested on
 - Pfsense 2.4.5-RELEASE on FreeBSD 11.3-STABLE
+
